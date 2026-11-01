@@ -1,19 +1,24 @@
 package com.aakash.pods
 
+import android.Manifest
 import android.app.Activity
 import android.app.ActivityManager
+import android.app.AlertDialog
 import android.app.KeyguardManager
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
 import android.os.SystemClock
 import android.text.TextUtils
+import android.util.Base64
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.PermissionRequest
+import android.webkit.URLUtil
 import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
@@ -27,6 +32,10 @@ import androidx.webkit.Profile
 import androidx.webkit.ProfileStore
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
+import org.json.JSONObject
+import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
  * Shows one tile. The WebView is bound to the tile's own profile, so its cookies,
@@ -43,6 +52,11 @@ class WebActivity : Activity() {
     private var unlocked = false
     private var pausedAt = 0L
     private var fileCallback: ValueCallback<Array<Uri>>? = null
+
+    private var pendingRequest: PermissionRequest? = null
+    private var pendingResources: List<String> = emptyList()
+    private val allowedThisSession = HashSet<String>()
+    private val notifyTimes = ArrayDeque<Long>()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,6 +87,11 @@ class WebActivity : Activity() {
         val w = createWebView()
         web = w
         content.addView(w, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
+
+        if (tile.keepAlive) {
+            KeepAlive.active.add(tile.id)
+            KeepAlive.sync(this)
+        }
 
         if (tile.locked) {
             content.visibility = View.INVISIBLE
@@ -142,7 +161,7 @@ class WebActivity : Activity() {
         s.setSupportMultipleWindows(false)
         s.allowFileAccess = false
         s.allowContentAccess = false
-        s.mediaPlaybackRequiresUserGesture = true
+        s.mediaPlaybackRequiresUserGesture = false
         s.setSupportZoom(true)
         s.builtInZoomControls = true
         s.displayZoomControls = false
@@ -155,8 +174,10 @@ class WebActivity : Activity() {
         p.cookieManager.setAcceptCookie(true)
         p.cookieManager.setAcceptThirdPartyCookies(w, true)
 
-        w.setDownloadListener { _, _, _, _, _ ->
-            Toast.makeText(this, "Downloads aren't supported yet", Toast.LENGTH_SHORT).show()
+        installBridge(w)
+
+        w.setDownloadListener { url, userAgent, contentDisposition, mimetype, _ ->
+            onDownload(url, userAgent, contentDisposition, mimetype)
         }
 
         w.webViewClient = object : WebViewClient() {
@@ -199,12 +220,190 @@ class WebActivity : Activity() {
                 }
             }
 
-            // Camera and microphone are off for now; deny rather than leave the page hanging.
             override fun onPermissionRequest(request: PermissionRequest) {
-                request.deny()
+                handlePermissionRequest(request)
+            }
+
+            override fun onPermissionRequestCanceled(request: PermissionRequest) {
+                if (pendingRequest === request) pendingRequest = null
             }
         }
         return w
+    }
+
+    // ---- Page bridge: notifications and blob downloads, available only to this tile's own site ----
+
+    private fun originOf(url: String): String {
+        val u = Uri.parse(url)
+        return if (u.port != -1) "${u.scheme}://${u.host}:${u.port}" else "${u.scheme}://${u.host}"
+    }
+
+    private fun installBridge(w: WebView) {
+        val origin = originOf(tile.url)
+        try {
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)) {
+                WebViewCompat.addWebMessageListener(
+                    w,
+                    "PodsBridge",
+                    setOf(origin),
+                    WebViewCompat.WebMessageListener { _, message, _, _, _ -> onBridgeMessage(message.data) },
+                )
+            }
+            if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+                WebViewCompat.addDocumentStartJavaScript(w, NOTIFICATION_SHIM, setOf(origin))
+            }
+        } catch (e: Exception) {
+            // Without the bridge the site still works; only notifications and blob downloads are lost.
+        }
+    }
+
+    private fun allowNotify(): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        while (notifyTimes.isNotEmpty() && now - notifyTimes.first() > 10_000L) notifyTimes.removeFirst()
+        if (notifyTimes.size >= 10) return false
+        notifyTimes.addLast(now)
+        return true
+    }
+
+    private fun onBridgeMessage(raw: String?) {
+        if (raw == null) return
+        val o = try {
+            JSONObject(raw)
+        } catch (e: Exception) {
+            return
+        }
+        when (o.optString("t")) {
+            "notify" -> {
+                if (allowNotify()) {
+                    Notifier.post(
+                        this,
+                        tile,
+                        o.optString("title").take(120),
+                        o.optString("body").take(500),
+                        o.optString("tag").take(80),
+                    )
+                }
+            }
+            "file" -> {
+                val name = Downloads.cleanName(o.optString("name", "download"))
+                val mime = o.optString("mime").ifEmpty { null }
+                val b64 = o.optString("b64")
+                Thread {
+                    try {
+                        val bytes = Base64.decode(b64, Base64.DEFAULT)
+                        val where = Downloads.save(this@WebActivity, name, mime) { out -> out.write(bytes) }
+                        runOnUiThread { toast("Saved to $where") }
+                    } catch (e: Exception) {
+                        runOnUiThread { toast("Download failed") }
+                    }
+                }.start()
+            }
+            else -> {}
+        }
+    }
+
+    // ---- Downloads ----
+
+    private fun onDownload(url: String, userAgent: String?, disposition: String?, mime: String?) {
+        val name = Downloads.cleanName(URLUtil.guessFileName(url, disposition, mime))
+        when {
+            url.startsWith("blob:") -> {
+                val js = BLOB_JS
+                    .replace("__URL__", JSONObject.quote(url))
+                    .replace("__NAME__", JSONObject.quote(name))
+                    .replace("__MIME__", JSONObject.quote(mime ?: ""))
+                web?.evaluateJavascript(js, null)
+                toast("Preparing $name...")
+            }
+            url.startsWith("https://") -> downloadHttp(url, userAgent, name, mime)
+            else -> toast("This kind of download isn't supported")
+        }
+    }
+
+    private fun downloadHttp(url: String, userAgent: String?, name: String, mime: String?) {
+        // Use this tile's own cookies, so downloads behind a login work.
+        val cookie = profile?.cookieManager?.getCookie(url)
+        val referer = tile.url
+        toast("Downloading $name...")
+        Thread {
+            try {
+                val c = URL(url).openConnection() as HttpURLConnection
+                if (userAgent != null) c.setRequestProperty("User-Agent", userAgent)
+                if (!cookie.isNullOrEmpty()) c.setRequestProperty("Cookie", cookie)
+                c.setRequestProperty("Referer", referer)
+                c.connectTimeout = 15_000
+                c.readTimeout = 60_000
+                if (c.responseCode !in 200..299) throw IOException("HTTP ${c.responseCode}")
+                val where = Downloads.save(this@WebActivity, name, mime ?: c.contentType) { out ->
+                    c.inputStream.use { it.copyTo(out) }
+                }
+                runOnUiThread { toast("Saved to $where") }
+            } catch (e: Exception) {
+                runOnUiThread { toast("Download failed: ${e.message}") }
+            }
+        }.start()
+    }
+
+    // ---- Camera and microphone ----
+
+    private fun handlePermissionRequest(request: PermissionRequest) {
+        val wanted = request.resources.filter {
+            it == PermissionRequest.RESOURCE_VIDEO_CAPTURE || it == PermissionRequest.RESOURCE_AUDIO_CAPTURE
+        }
+        if (wanted.isEmpty()) {
+            request.deny()
+            return
+        }
+        val key = request.origin.toString() + wanted.sorted().joinToString(",")
+        if (key in allowedThisSession) {
+            grantWithAndroidPermission(request, wanted)
+            return
+        }
+        val what = wanted.joinToString(" and ") {
+            if (it == PermissionRequest.RESOURCE_VIDEO_CAPTURE) "camera" else "microphone"
+        }
+        val host = request.origin.host ?: tile.name
+        AlertDialog.Builder(this)
+            .setTitle("Allow $host?")
+            .setMessage("This site wants to use your $what.")
+            .setPositiveButton("Allow") { _, _ ->
+                allowedThisSession.add(key)
+                grantWithAndroidPermission(request, wanted)
+            }
+            .setNegativeButton("Block") { _, _ -> request.deny() }
+            .setOnCancelListener { request.deny() }
+            .show()
+    }
+
+    private fun grantWithAndroidPermission(request: PermissionRequest, wanted: List<String>) {
+        val needed = wanted
+            .map {
+                if (it == PermissionRequest.RESOURCE_VIDEO_CAPTURE) Manifest.permission.CAMERA
+                else Manifest.permission.RECORD_AUDIO
+            }
+            .filter { checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED }
+        if (needed.isEmpty()) {
+            request.grant(wanted.toTypedArray())
+            return
+        }
+        pendingRequest?.deny()
+        pendingRequest = request
+        pendingResources = wanted
+        requestPermissions(needed.toTypedArray(), REQ_PERM)
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode != REQ_PERM) return
+        pausedAt = 0L
+        val req = pendingRequest
+        pendingRequest = null
+        if (req == null) return
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            req.grant(pendingResources.toTypedArray())
+        } else {
+            req.deny()
+        }
     }
 
     /**
@@ -219,6 +418,8 @@ class WebActivity : Activity() {
             default.replace("; wv", "").replace(" Version/4.0", "")
         }
     }
+
+    // ---- Screen lock ----
 
     private fun requestUnlock() {
         val km = getSystemService(KEYGUARD_SERVICE) as KeyguardManager
@@ -266,7 +467,8 @@ class WebActivity : Activity() {
         super.onPause()
         if (!::tile.isInitialized) return
         pausedAt = SystemClock.elapsedRealtime()
-        web?.onPause()
+        // Sites that asked to stay connected keep running while the app is in the background.
+        if (!tile.keepAlive) web?.onPause()
         profile?.cookieManager?.flush()
     }
 
@@ -286,26 +488,90 @@ class WebActivity : Activity() {
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         val w = web
-        if (unlocked && w != null && w.canGoBack()) w.goBack() else finish()
+        when {
+            unlocked && w != null && w.canGoBack() -> w.goBack()
+            // Stay-connected sites go to the background instead of closing; use the X to close for real.
+            unlocked && ::tile.isInitialized && tile.keepAlive -> moveTaskToBack(true)
+            else -> finish()
+        }
     }
 
     override fun onDestroy() {
         fileCallback?.onReceiveValue(null)
         fileCallback = null
+        pendingRequest?.deny()
+        pendingRequest = null
         web?.let { w ->
             w.stopLoading()
             (w.parent as? ViewGroup)?.removeView(w)
             w.destroy()
         }
         web = null
+        if (::tile.isInitialized && tile.keepAlive) {
+            KeepAlive.active.remove(tile.id)
+            KeepAlive.sync(this)
+        }
         super.onDestroy()
     }
+
+    private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_LONG).show()
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     private companion object {
         const val REQ_UNLOCK = 1
         const val REQ_FILE = 2
+        const val REQ_PERM = 3
         const val RELOCK_AFTER_MS = 60_000L
+
+        /** Turns the page's Notification API into Android notifications. */
+        const val NOTIFICATION_SHIM = """
+(function () {
+  if (window.__podsShim) return;
+  window.__podsShim = true;
+  function send(o) {
+    try { if (window.PodsBridge) window.PodsBridge.postMessage(JSON.stringify(o)); } catch (e) {}
+  }
+  function N(title, opts) {
+    opts = opts || {};
+    this.title = String(title);
+    this.body = String(opts.body || '');
+    this.tag = String(opts.tag || '');
+    this.onclick = null; this.onclose = null; this.onerror = null; this.onshow = null;
+    send({ t: 'notify', title: this.title, body: this.body, tag: this.tag });
+    var self = this;
+    setTimeout(function () { if (typeof self.onshow === 'function') { try { self.onshow(); } catch (e) {} } }, 0);
+  }
+  N.prototype.close = function () {};
+  N.prototype.addEventListener = function () {};
+  N.prototype.removeEventListener = function () {};
+  N.prototype.dispatchEvent = function () { return true; };
+  N.requestPermission = function (cb) {
+    if (typeof cb === 'function') cb('granted');
+    return Promise.resolve('granted');
+  };
+  Object.defineProperty(N, 'permission', { get: function () { return 'granted'; } });
+  N.maxActions = 0;
+  window.Notification = N;
+})();
+"""
+
+        /** Reads a blob: URL inside the page and hands the bytes to the app. */
+        const val BLOB_JS = """
+(function () {
+  var u = __URL__, n = __NAME__, m = __MIME__;
+  fetch(u).then(function (r) { return r.blob(); }).then(function (b) {
+    var fr = new FileReader();
+    fr.onloadend = function () {
+      var s = String(fr.result);
+      var i = s.indexOf(',');
+      try {
+        window.PodsBridge.postMessage(JSON.stringify({ t: 'file', name: n, mime: m || b.type, b64: s.substring(i + 1) }));
+      } catch (e) {}
+    };
+    fr.readAsDataURL(b);
+  });
+})();
+"""
     }
 }

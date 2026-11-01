@@ -2,11 +2,14 @@ package com.aakash.pods
 
 import android.app.Activity
 import android.app.AlertDialog
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.text.InputType
 import android.text.TextUtils
@@ -88,6 +91,17 @@ class MainActivity : Activity() {
         scroll.addView(column)
         root.addView(scroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
         setContentView(root)
+
+        // Ask once for permission to show notifications (Android 13+).
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            val prefs = getSharedPreferences("pods", MODE_PRIVATE)
+            if (!prefs.getBoolean("asked_notifications", false)) {
+                prefs.edit().putBoolean("asked_notifications", true).apply()
+                requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 10)
+            }
+        }
     }
 
     override fun onResume() {
@@ -182,6 +196,7 @@ class MainActivity : Activity() {
             "Change address",
             if (t.locked) "Stop requiring screen lock" else "Require screen lock to open",
             if (t.desktop) "Use mobile site" else "Use desktop site",
+            if (t.keepAlive) "Stop staying connected in background" else "Stay connected in background",
             "Delete (erases its login)",
         )
         AlertDialog.Builder(this)
@@ -209,7 +224,15 @@ class MainActivity : Activity() {
                         TileStore.update(this, t.copy(desktop = !t.desktop))
                         refresh()
                     }
-                    4 -> confirmDelete(t)
+                    4 -> {
+                        TileStore.update(this, t.copy(keepAlive = !t.keepAlive))
+                        refresh()
+                        toast(
+                            if (t.keepAlive) "Applies next time you open ${t.name}."
+                            else "${t.name} will keep running in the background for notifications. This uses battery."
+                        )
+                    }
+                    5 -> confirmDelete(t)
                     else -> {}
                 }
             }
@@ -260,6 +283,7 @@ class MainActivity : Activity() {
         }
         val desktop = CheckBox(this).apply { text = "Request desktop site" }
         val lock = CheckBox(this).apply { text = "Require screen lock to open" }
+        val keep = CheckBox(this).apply { text = "Stay connected in background (for notifications)" }
 
         spinner.setSelection(TEMPLATES.lastIndex)
         spinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
@@ -268,6 +292,7 @@ class MainActivity : Activity() {
                 urlIn.setText(tpl.url)
                 desktop.isChecked = tpl.desktop
                 lock.isChecked = tpl.lock
+                keep.isChecked = tpl.keep
                 nameIn.setText(if (position == TEMPLATES.lastIndex) "" else tpl.label)
             }
 
@@ -282,6 +307,7 @@ class MainActivity : Activity() {
             addView(urlIn)
             addView(desktop)
             addView(lock)
+            addView(keep)
         }
 
         AlertDialog.Builder(this)
@@ -293,7 +319,7 @@ class MainActivity : Activity() {
                     toast("That doesn't look like a web address")
                 } else {
                     val name = nameIn.text.toString().trim().ifEmpty { Uri.parse(url).host ?: "Site" }
-                    TileStore.add(this, Tile(TileStore.newId(), name, url, desktop.isChecked, lock.isChecked))
+                    TileStore.add(this, Tile(TileStore.newId(), name, url, desktop.isChecked, lock.isChecked, keep.isChecked))
                     refresh()
                 }
             }

@@ -29,9 +29,19 @@ For updates that keep logins, sign every build with one permanent key: set the `
 `PODS_STORE_PASSWORD` (and optionally `PODS_KEY_ALIAS`, `PODS_KEY_PASSWORD`) environment
 variables, or GitHub secrets for the workflow. Never commit the keystore to a public repo.
 
-## Known limits (v0.1)
-- No push notifications (WebView can't receive web push), so WhatsApp only updates while open.
-- No camera, microphone or file downloads yet (file uploads work).
+## Features
+- **Camera and microphone:** a site asks, you tap Allow or Block (remembered until you close the tile).
+- **Downloads:** saved to your Downloads folder, using that tile's own login. Blob downloads
+  (like WhatsApp Web media) go through a bridge that only exists on the tile's own site.
+- **Notifications:** the page's Notification API becomes real Android notifications. Tiles set to
+  "Stay connected in background" (on by default for WhatsApp Web) keep running behind a small
+  ongoing notification, so messages still arrive. Back button sends such a tile to the
+  background; the X closes it. Locked tiles show no message text in notifications.
+
+## Known limits
+- Notifications work only while the tile is open or staying connected. Android may still stop
+  it on phones with aggressive battery savers; exclude Pods from battery optimization.
+- Real web push (notifications with the site fully closed) isn't possible inside a WebView.
 - Google sign-in inside a WebView may be blocked; the app presents itself as Chrome, which
   usually helps, but it isn't guaranteed. Email/password logins are unaffected.
-- Not yet compiled or run on a device. Expect a round of fixes after the first build.
+- Only tested by compiling so far; not yet run on a device.

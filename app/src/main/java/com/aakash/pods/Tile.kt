@@ -12,6 +12,7 @@ data class Tile(
     val url: String,
     val desktop: Boolean,
     val locked: Boolean,
+    val keepAlive: Boolean = false,
 ) {
     val profile: String get() = "t_$id"
 }
@@ -21,10 +22,11 @@ data class Template(
     val url: String,
     val desktop: Boolean,
     val lock: Boolean,
+    val keep: Boolean = false,
 )
 
 val TEMPLATES = listOf(
-    Template("WhatsApp Web", "https://web.whatsapp.com", desktop = true, lock = false),
+    Template("WhatsApp Web", "https://web.whatsapp.com", desktop = true, lock = false, keep = true),
     Template("Gmail", "https://mail.google.com", desktop = false, lock = false),
     Template("ChatGPT", "https://chatgpt.com", desktop = false, lock = false),
     Template("Claude", "https://claude.ai", desktop = false, lock = false),
@@ -49,6 +51,7 @@ object TileStore {
                     url = o.getString("url"),
                     desktop = o.optBoolean("desktop", false),
                     locked = o.optBoolean("locked", false),
+                    keepAlive = o.optBoolean("keepAlive", false),
                 )
             )
         }
@@ -65,6 +68,7 @@ object TileStore {
                     .put("url", t.url)
                     .put("desktop", t.desktop)
                     .put("locked", t.locked)
+                    .put("keepAlive", t.keepAlive)
             )
         }
         ctx.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString(KEY, arr.toString()).apply()
